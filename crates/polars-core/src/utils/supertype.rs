@@ -153,7 +153,7 @@ pub fn get_supertype_with_options(
 ) -> Option<DataType> {
     fn inner(l: &DataType, r: &DataType, options: SuperTypeOptions) -> Option<DataType> {
         use DataType::*;
-        if l == r {
+        if l == r && l.is_known() {
             return Some(l.clone());
         }
         match (l, r) {
@@ -537,8 +537,8 @@ pub fn get_supertype_with_options(
                     UnknownKind::Int(v) if dt.is_primitive_numeric() => {
                         // Both dyn int
                         if let Unknown(UnknownKind::Int(v_other)) = dt {
-                            // Take the maximum value to ensure we bubble up the required minimal size.
-                            Some(Unknown(UnknownKind::Int(std::cmp::max(*v, *v_other))))
+                            // Preserve signedness and required two's-complement width across both literals.
+                            Some(Unknown(UnknownKind::Int(unify_dyn_int(*v, *v_other))))
                         }
                         // dyn int vs number
                         else {
@@ -608,7 +608,7 @@ fn union_struct_fields(fields_a: &[Field], fields_b: &[Field]) -> Option<DataTyp
         let dtype_longest = longest_map
             .entry(&field.name)
             .or_insert_with(|| field.dtype.clone());
-        if &field.dtype != dtype_longest {
+        if &field.dtype != dtype_longest || !field.dtype.is_known() {
             let st = get_supertype(&field.dtype, dtype_longest)?;
             *dtype_longest = st
         }
@@ -693,6 +693,16 @@ fn materialize_smallest_dyn_int(v: i128) -> AnyValue<'static> {
     materialize_dyn_int(v)
 }
 
+fn unify_dyn_int(a: i128, b: i128) -> i128 {
+    match (a >= 0, b >= 0) {
+        (true, true) => a.max(b),
+        (false, false) => a.min(b),
+        // A positive bound p needs signed width holding -1 - p (e.g. +128 -> -129, i16).
+        (true, false) => b.min(-1 - a),
+        (false, true) => a.min(-1 - b),
+    }
+}
+
 pub fn merge_dtypes_many<I: IntoIterator<Item = D> + Clone, D: AsRef<DataType>>(
     into_iter: I,
 ) -> PolarsResult<DataType> {
@@ -708,4 +718,163 @@ pub fn merge_dtypes_many<I: IntoIterator<Item = D> + Clone, D: AsRef<DataType>>(
     }
 
     Ok(st)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_dyn_int(dt: Option<DataType>, expected: i128) {
+        match dt {
+            Some(DataType::Unknown(UnknownKind::Int(v))) => assert_eq!(v, expected),
+            other => panic!("expected Unknown(UnknownKind::Int({expected})), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unify_dyn_int_boundaries() {
+        assert_eq!(unify_dyn_int(0, 0), 0);
+        assert_eq!(unify_dyn_int(1, 2), 2);
+        assert_eq!(unify_dyn_int(1, 300), 300);
+        assert_eq!(unify_dyn_int(-1, -1), -1);
+        assert_eq!(unify_dyn_int(-10, -1000), -1000);
+        assert_eq!(unify_dyn_int(1, -1), -2);
+        assert_eq!(unify_dyn_int(-1, 1), -2);
+        assert_eq!(unify_dyn_int(0, -1), -1);
+        assert_eq!(unify_dyn_int(127, -1), -128);
+        assert_eq!(unify_dyn_int(128, -1), -129);
+        assert_eq!(unify_dyn_int(i128::MAX, 0), i128::MAX);
+        assert_eq!(unify_dyn_int(i128::MAX, -1), i128::MIN);
+        assert_eq!(unify_dyn_int(1, i128::MIN), i128::MIN);
+        assert_eq!(unify_dyn_int(i128::MIN, i128::MIN), i128::MIN);
+        assert_eq!(unify_dyn_int(i128::MAX, i128::MIN), i128::MIN);
+    }
+
+    #[test]
+    fn test_supertype_dyn_int_pairs_and_unsigned() {
+        let pos1 = DataType::Unknown(UnknownKind::Int(1));
+        let pos2 = DataType::Unknown(UnknownKind::Int(2));
+        let neg1 = DataType::Unknown(UnknownKind::Int(-1));
+        let neg10 = DataType::Unknown(UnknownKind::Int(-10));
+        let neg1000 = DataType::Unknown(UnknownKind::Int(-1000));
+
+        let mixed = get_supertype(&pos1, &neg1);
+        assert_dyn_int(mixed.clone(), -2);
+        assert_dyn_int(get_supertype(&neg1, &pos1), -2);
+        assert_dyn_int(get_supertype(&pos1, &pos2), 2);
+        assert_dyn_int(get_supertype(&neg10, &neg1000), -1000);
+
+        assert_eq!(
+            get_supertype(mixed.as_ref().unwrap(), &DataType::UInt32),
+            Some(DataType::Int64)
+        );
+        assert_eq!(
+            get_supertype(mixed.as_ref().unwrap(), &DataType::UInt64),
+            Some(DataType::Int64)
+        );
+        assert_eq!(
+            get_supertype(&DataType::Unknown(UnknownKind::Int(2)), &DataType::UInt32),
+            Some(DataType::UInt32)
+        );
+
+        let list_mixed = get_supertype(
+            &DataType::List(Box::new(pos1.clone())),
+            &DataType::List(Box::new(neg1.clone())),
+        );
+        match list_mixed {
+            Some(DataType::List(inner)) => assert_dyn_int(Some(*inner), -2),
+            other => panic!("expected List(Unknown(Int(-2))), got {other:?}"),
+        }
+    }
+
+    #[cfg(all(
+        feature = "dtype-u8",
+        feature = "dtype-u16",
+        feature = "dtype-i8",
+        feature = "dtype-i16",
+        feature = "dtype-i128",
+        feature = "dtype-u128"
+    ))]
+    #[test]
+    fn test_supertype_dyn_int_optional_widths() {
+        let pos1 = DataType::Unknown(UnknownKind::Int(1));
+        let pos2 = DataType::Unknown(UnknownKind::Int(2));
+        let pos128 = DataType::Unknown(UnknownKind::Int(128));
+        let pos300 = DataType::Unknown(UnknownKind::Int(300));
+        let neg1 = DataType::Unknown(UnknownKind::Int(-1));
+        let neg200 = DataType::Unknown(UnknownKind::Int(-200));
+
+        let mixed = get_supertype(&pos1, &neg1).unwrap();
+        assert_eq!(
+            get_supertype(&mixed, &DataType::UInt8),
+            Some(DataType::Int16)
+        );
+        assert_eq!(
+            get_supertype(&mixed, &DataType::UInt16),
+            Some(DataType::Int32)
+        );
+        assert_eq!(
+            get_supertype(&mixed, &DataType::UInt128),
+            Some(DataType::Int128)
+        );
+
+        let pos_only = get_supertype(&pos1, &pos2).unwrap();
+        assert_eq!(
+            get_supertype(&pos_only, &DataType::UInt8),
+            Some(DataType::UInt8)
+        );
+
+        let wide_pos = get_supertype(&pos1, &pos300).unwrap();
+        assert_eq!(
+            get_supertype(&wide_pos, &DataType::UInt8),
+            Some(DataType::UInt16)
+        );
+
+        let boundary = get_supertype(&pos128, &neg1).unwrap();
+        assert_eq!(
+            get_supertype(&boundary, &DataType::Int8),
+            Some(DataType::Int16)
+        );
+
+        let neg_wide = get_supertype(&neg1, &neg200).unwrap();
+        assert_eq!(
+            get_supertype(&neg_wide, &DataType::UInt8),
+            Some(DataType::Int16)
+        );
+
+        let big = get_supertype(&DataType::Unknown(UnknownKind::Int(1i128 << 63)), &neg1).unwrap();
+        assert_eq!(
+            get_supertype(&big, &DataType::UInt64),
+            Some(DataType::Int128)
+        );
+    }
+
+    #[cfg(feature = "dtype-struct")]
+    #[test]
+    fn test_supertype_dyn_int_in_struct() {
+        let s1 = DataType::Struct(vec![Field::new(
+            PlSmallStr::from_static("a"),
+            DataType::Unknown(UnknownKind::Int(1)),
+        )]);
+        let s2 = DataType::Struct(vec![
+            Field::new(
+                PlSmallStr::from_static("a"),
+                DataType::Unknown(UnknownKind::Int(-1)),
+            ),
+            Field::new(PlSmallStr::from_static("b"), DataType::Int32),
+        ]);
+        let s3 = DataType::Struct(vec![Field::new(
+            PlSmallStr::from_static("a"),
+            DataType::Unknown(UnknownKind::Int(-1)),
+        )]);
+
+        for combined in [get_supertype(&s1, &s2), get_supertype(&s1, &s3)] {
+            match combined {
+                Some(DataType::Struct(fields)) => {
+                    assert_dyn_int(Some(fields[0].dtype().clone()), -2);
+                },
+                other => panic!("expected Struct with unified dyn int, got {other:?}"),
+            }
+        }
+    }
 }

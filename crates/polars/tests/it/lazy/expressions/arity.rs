@@ -369,3 +369,242 @@ fn test_binary_group_consistency() -> PolarsResult<()> {
 
     Ok(())
 }
+
+fn assert_lazy_and_streaming_eq(mut lf: LazyFrame, expected: &DataFrame) -> PolarsResult<()> {
+    let schema = lf.collect_schema()?;
+    assert_eq!(schema.as_ref(), expected.schema().as_ref());
+
+    let in_mem = lf.clone().collect()?;
+    assert_eq!(in_mem.schema(), expected.schema());
+    assert!(in_mem.equals_missing(expected));
+
+    #[cfg(feature = "streaming")]
+    {
+        let streaming = lf.with_streaming(true).collect()?;
+        assert_eq!(streaming.schema(), expected.schema());
+        assert!(streaming.equals_missing(expected));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_when_then_dyn_int_unsigned_arithmetic_30674() -> PolarsResult<()> {
+    let df = df![
+        "side" => ["buy", "sell"],
+        "qty" => [10u32, 4u32],
+    ]?;
+
+    let pos_neg = when(col("side").eq(lit("buy"))).then(1).otherwise(-1);
+    let neg_pos = when(col("side").eq(lit("buy"))).then(-1).otherwise(1);
+
+    let q = df.clone().lazy().select([
+        (pos_neg.clone() * col("qty")).alias("signed_qty"),
+        (neg_pos * col("qty")).alias("rev_signed_qty"),
+        (pos_neg.clone() + col("qty")).alias("added"),
+        (pos_neg.clone() - col("qty")).alias("subtracted"),
+        pos_neg.clone().lt(col("qty")).alias("lt_cmp"),
+        pos_neg.clone().eq(col("qty")).alias("eq_cmp"),
+    ]);
+    let expected = df![
+        "signed_qty" => [10i64, -4i64],
+        "rev_signed_qty" => [-10i64, 4i64],
+        "added" => [11i64, 3i64],
+        "subtracted" => [-9i64, -5i64],
+        "lt_cmp" => [true, true],
+        "eq_cmp" => [false, false],
+    ]?;
+    assert_lazy_and_streaming_eq(q, &expected)?;
+
+    let q_sum = df
+        .clone()
+        .lazy()
+        .select([(pos_neg.clone() * col("qty")).sum().alias("net_qty")]);
+    assert_lazy_and_streaming_eq(q_sum, &df!["net_qty" => [6i64]]?)?;
+
+    assert_lazy_and_streaming_eq(
+        df.clone().lazy().select([pos_neg.clone().alias("sign")]),
+        &df!["sign" => [1i32, -1i32]]?,
+    )?;
+    let mut q_wide = df.lazy().select([when(col("side").eq(lit("buy")))
+        .then(1)
+        .otherwise(10_i64.pow(12))
+        .alias("wide")]);
+    assert_eq!(q_wide.collect_schema()?.get("wide"), Some(&DataType::Int64));
+
+    let df_nulls = df![
+        "side" => [Some("buy"), Some("sell"), None, Some("buy"), Some("sell")],
+        "qty" => [Some(10u32), Some(4u32), Some(5u32), None, Some(0u32)],
+    ]?;
+    assert_lazy_and_streaming_eq(
+        df_nulls
+            .lazy()
+            .select([(pos_neg * col("qty")).alias("signed_qty")]),
+        &df!["signed_qty" => [Some(10i64), Some(-4i64), Some(-5i64), None, Some(0i64)]]?,
+    )?;
+
+    Ok(())
+}
+
+#[test]
+#[cfg(all(
+    feature = "dtype-u8",
+    feature = "dtype-u16",
+    feature = "dtype-i8",
+    feature = "dtype-i16",
+    feature = "dtype-u128",
+    feature = "dtype-i128"
+))]
+fn test_when_then_dyn_int_width_matrix_30674() -> PolarsResult<()> {
+    let base = df![
+        "side" => ["buy", "sell"],
+        "qty" => [10i64, 4i64],
+    ]?;
+    let pos_neg = when(col("side").eq(lit("buy"))).then(1).otherwise(-1);
+    let pos_only = when(col("side").eq(lit("buy"))).then(1).otherwise(2);
+
+    for (input_dtype, expected_dtype) in [
+        (DataType::UInt8, DataType::Int16),
+        (DataType::UInt16, DataType::Int32),
+        (DataType::UInt32, DataType::Int64),
+        (DataType::UInt64, DataType::Int64),
+        (DataType::UInt128, DataType::Int128),
+    ] {
+        let mut df = base.clone();
+        df.with_column(df.column("qty")?.cast(&input_dtype)?)?;
+        let q = df
+            .lazy()
+            .select([(pos_neg.clone() * col("qty")).alias("out")]);
+        let expected_col = df!["out" => [10i64, -4i64]]?
+            .column("out")?
+            .cast(&expected_dtype)?;
+        let expected = DataFrame::new(2, vec![expected_col])?;
+        assert_lazy_and_streaming_eq(q, &expected)?;
+    }
+
+    for unsigned_dtype in [
+        DataType::UInt8,
+        DataType::UInt16,
+        DataType::UInt32,
+        DataType::UInt64,
+        DataType::UInt128,
+    ] {
+        let mut df = base.clone();
+        df.with_column(df.column("qty")?.cast(&unsigned_dtype)?)?;
+        let q = df
+            .lazy()
+            .select([(pos_only.clone() * col("qty")).alias("out")]);
+        let expected_col = df!["out" => [10i64, 8i64]]?
+            .column("out")?
+            .cast(&unsigned_dtype)?;
+        let expected = DataFrame::new(2, vec![expected_col])?;
+        assert_lazy_and_streaming_eq(q, &expected)?;
+    }
+
+    for signed_dtype in [
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::Int128,
+    ] {
+        let mut df = base.clone();
+        df.with_column(df.column("qty")?.cast(&signed_dtype)?)?;
+        let q = df
+            .lazy()
+            .select([(pos_neg.clone() * col("qty")).alias("out")]);
+        let expected_col = df!["out" => [10i64, -4i64]]?
+            .column("out")?
+            .cast(&signed_dtype)?;
+        let expected = DataFrame::new(2, vec![expected_col])?;
+        assert_lazy_and_streaming_eq(q, &expected)?;
+    }
+
+    let df_u8 = df![
+        "side" => ["buy", "sell"],
+        "qty" => [10u8, 4u8],
+    ]?;
+    assert_lazy_and_streaming_eq(
+        df_u8
+            .lazy()
+            .select([
+                (when(col("side").eq(lit("buy"))).then(-1).otherwise(-200) * col("qty"))
+                    .alias("out"),
+            ]),
+        &df!["out" => [-10i16, -800i16]]?,
+    )?;
+
+    let df_i8 = df![
+        "side" => ["buy", "sell"],
+        "x" => [1i8, 1i8],
+    ]?;
+    assert_lazy_and_streaming_eq(
+        df_i8
+            .lazy()
+            .select([
+                (when(col("side").eq(lit("buy"))).then(128).otherwise(-1) + col("x")).alias("out"),
+            ]),
+        &df!["out" => [129i16, 0i16]]?,
+    )?;
+
+    let df_u64_big = df![
+        "side" => ["buy", "sell"],
+        "qty" => [(1u64 << 63) + 1, 4u64],
+    ]?;
+    assert_lazy_and_streaming_eq(
+        df_u64_big
+            .lazy()
+            .select([(pos_neg * col("qty")).alias("out")]),
+        &df!["out" => [None, Some(-4i64)]]?,
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn test_dyn_int_sibling_supertype_paths_30674() -> PolarsResult<()> {
+    let df = df![
+        "side" => ["buy", "sell"],
+        "qty" => [10u32, 4u32],
+    ]?;
+
+    let q_list = df
+        .clone()
+        .lazy()
+        .select([concat_list([lit(1), lit(-1), col("qty")])?.alias("out")]);
+    let expected_list = df![
+        "out" => [
+            AnyValue::List(Series::new("".into(), [1i64, -1, 10])),
+            AnyValue::List(Series::new("".into(), [1i64, -1, 4])),
+        ]
+    ]?;
+    assert_lazy_and_streaming_eq(q_list, &expected_list)?;
+
+    #[cfg(feature = "list_arithmetic")]
+    {
+        let q_list_mul = df
+            .clone()
+            .lazy()
+            .select([(concat_list([lit(1), lit(-1)])? * col("qty")).alias("out")]);
+        let expected_list_mul = df![
+            "out" => [
+                AnyValue::List(Series::new("".into(), [10i64, -10])),
+                AnyValue::List(Series::new("".into(), [4i64, -4])),
+            ]
+        ]?;
+        assert_lazy_and_streaming_eq(q_list_mul, &expected_list_mul)?;
+    }
+
+    #[cfg(feature = "coalesce")]
+    {
+        let branch_with_nulls = when(col("side").eq(lit("buy")))
+            .then(1)
+            .otherwise(lit(LiteralValue::untyped_null()));
+        let q_coalesce = df
+            .lazy()
+            .select([(coalesce(&[branch_with_nulls, lit(-1)]) * col("qty")).alias("out")]);
+        assert_lazy_and_streaming_eq(q_coalesce, &df!["out" => [10i64, -4i64]]?)?;
+    }
+
+    Ok(())
+}

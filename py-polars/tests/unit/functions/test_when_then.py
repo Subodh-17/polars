@@ -11,10 +11,10 @@ import polars as pl
 import polars.selectors as cs
 from polars.exceptions import InvalidOperationError, ShapeError
 from polars.meta import get_index_type
-from polars.testing import assert_frame_equal, assert_series_equal
+from polars.testing import assert_frame_equal, assert_schema_equal, assert_series_equal
 
 if TYPE_CHECKING:
-    from polars._typing import EngineType
+    from polars._typing import EngineType, PolarsIntegerType
 
 
 def test_when_then() -> None:
@@ -1056,3 +1056,208 @@ def test_when_then_masked_cse_column_height_mismatch() -> None:
     assert "__POLARS_CSER" in q.explain()
     with pytest.raises(ShapeError):
         q.collect()
+
+
+@pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+def test_when_then_dyn_int_unsigned_arithmetic_30674(engine: EngineType) -> None:
+    df = pl.DataFrame(
+        {"side": ["buy", "sell"], "qty": [10, 4]},
+        schema={"side": pl.String, "qty": pl.UInt32},
+    )
+    pos_neg = pl.when(pl.col("side") == "buy").then(1).otherwise(-1)
+    neg_pos = pl.when(pl.col("side") == "buy").then(-1).otherwise(1)
+
+    exprs = [
+        (pos_neg * pl.col("qty")).alias("signed_qty"),
+        (neg_pos * pl.col("qty")).alias("rev_signed_qty"),
+        (pos_neg + pl.col("qty")).alias("added"),
+        (pos_neg - pl.col("qty")).alias("subtracted"),
+        (pos_neg < pl.col("qty")).alias("lt_cmp"),
+        (pos_neg == pl.col("qty")).alias("eq_cmp"),
+    ]
+    expected = pl.DataFrame(
+        {
+            "signed_qty": [10, -4],
+            "rev_signed_qty": [-10, 4],
+            "added": [11, 3],
+            "subtracted": [-9, -5],
+            "lt_cmp": [True, True],
+            "eq_cmp": [False, False],
+        },
+        schema={
+            "signed_qty": pl.Int64,
+            "rev_signed_qty": pl.Int64,
+            "added": pl.Int64,
+            "subtracted": pl.Int64,
+            "lt_cmp": pl.Boolean,
+            "eq_cmp": pl.Boolean,
+        },
+    )
+
+    q = df.lazy().select(exprs)
+    assert_schema_equal(q.collect_schema(), expected.schema)
+    assert_frame_equal(q.collect(engine=engine), expected)
+    assert_frame_equal(df.select(exprs), expected)
+
+    q_sum = df.lazy().select((pos_neg * pl.col("qty")).sum().alias("net_qty"))
+    expected_sum = pl.DataFrame({"net_qty": [6]}, schema={"net_qty": pl.Int64})
+    assert_frame_equal(q_sum.collect(engine=engine), expected_sum)
+
+    df_nulls = pl.DataFrame(
+        {
+            "side": ["buy", "sell", None, "buy", "sell"],
+            "qty": [10, 4, 5, None, 0],
+        },
+        schema={"side": pl.String, "qty": pl.UInt32},
+    )
+    expected_nulls = pl.DataFrame(
+        {"signed_qty": [10, -4, -5, None, 0]},
+        schema={"signed_qty": pl.Int64},
+    )
+    assert_frame_equal(
+        df_nulls.lazy()
+        .select((pos_neg * pl.col("qty")).alias("signed_qty"))
+        .collect(engine=engine),
+        expected_nulls,
+    )
+
+    assert_frame_equal(
+        df.lazy().select(pos_neg.alias("sign")).collect(engine=engine),
+        pl.DataFrame({"sign": [1, -1]}, schema={"sign": pl.Int32}),
+    )
+    assert_schema_equal(
+        df.lazy()
+        .select(
+            pl.when(pl.col("side") == "buy").then(1).otherwise(10**12).alias("wide")
+        )
+        .collect_schema(),
+        pl.Schema({"wide": pl.Int64}),
+    )
+
+    q_sibling = df.lazy().select(
+        (pl.concat_list(1, -1) * pl.col("qty")).alias("concat_mul"),
+        (
+            pl.coalesce(pl.when(pl.col("side") == "buy").then(1), -1) * pl.col("qty")
+        ).alias("coal_mul"),
+    )
+    expected_sibling = pl.DataFrame(
+        {
+            "concat_mul": [[10, -10], [4, -4]],
+            "coal_mul": [10, -4],
+        },
+        schema={
+            "concat_mul": pl.List(pl.Int64),
+            "coal_mul": pl.Int64,
+        },
+    )
+    assert_frame_equal(q_sibling.collect(engine=engine), expected_sibling)
+
+
+@pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+@pytest.mark.parametrize(
+    ("input_dtype", "expected_dtype"),
+    [
+        (pl.UInt8, pl.Int16),
+        (pl.UInt16, pl.Int32),
+        (pl.UInt32, pl.Int64),
+        (pl.UInt64, pl.Int64),
+        (pl.UInt128, pl.Int128),
+    ],
+)
+def test_when_then_dyn_int_unsigned_widths_30674(
+    engine: EngineType,
+    input_dtype: PolarsIntegerType,
+    expected_dtype: PolarsIntegerType,
+) -> None:
+    df = pl.DataFrame(
+        {"side": ["buy", "sell"], "qty": [10, 4]},
+        schema={"side": pl.String, "qty": input_dtype},
+    )
+
+    q_mixed = df.lazy().select(
+        (pl.when(pl.col("side") == "buy").then(1).otherwise(-1) * pl.col("qty")).alias(
+            "out"
+        )
+    )
+    expected_mixed = pl.DataFrame(
+        {"out": [10, -4]},
+        schema={"out": expected_dtype},
+    )
+    assert_schema_equal(q_mixed.collect_schema(), expected_mixed.schema)
+    assert_frame_equal(q_mixed.collect(engine=engine), expected_mixed)
+
+    q_pos = df.lazy().select(
+        (pl.when(pl.col("side") == "buy").then(1).otherwise(2) * pl.col("qty")).alias(
+            "out"
+        )
+    )
+    expected_pos = pl.DataFrame(
+        {"out": [10, 8]},
+        schema={"out": input_dtype},
+    )
+    assert_schema_equal(q_pos.collect_schema(), expected_pos.schema)
+    assert_frame_equal(q_pos.collect(engine=engine), expected_pos)
+
+
+@pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+def test_when_then_dyn_int_signed_negative_and_boundaries_30674(
+    engine: EngineType,
+) -> None:
+    for signed_dtype in [pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.Int128]:
+        df = pl.DataFrame(
+            {"side": ["buy", "sell"], "qty": [10, 4]},
+            schema={"side": pl.String, "qty": signed_dtype},
+        )
+        expected = pl.DataFrame({"out": [10, -4]}, schema={"out": signed_dtype})
+        q = df.lazy().select(
+            (
+                pl.when(pl.col("side") == "buy").then(1).otherwise(-1) * pl.col("qty")
+            ).alias("out")
+        )
+        assert_frame_equal(q.collect(engine=engine), expected)
+
+    df_u8 = pl.DataFrame(
+        {"side": ["buy", "sell"], "qty": [10, 4]},
+        schema={"side": pl.String, "qty": pl.UInt8},
+    )
+    assert_frame_equal(
+        df_u8.lazy()
+        .select(
+            (
+                pl.when(pl.col("side") == "buy").then(-1).otherwise(-200)
+                * pl.col("qty")
+            ).alias("out")
+        )
+        .collect(engine=engine),
+        pl.DataFrame({"out": [-10, -800]}, schema={"out": pl.Int16}),
+    )
+
+    df_i8 = pl.DataFrame(
+        {"side": ["buy", "sell"], "x": [1, 1]},
+        schema={"side": pl.String, "x": pl.Int8},
+    )
+    assert_frame_equal(
+        df_i8.lazy()
+        .select(
+            (
+                pl.when(pl.col("side") == "buy").then(128).otherwise(-1) + pl.col("x")
+            ).alias("out")
+        )
+        .collect(engine=engine),
+        pl.DataFrame({"out": [129, 0]}, schema={"out": pl.Int16}),
+    )
+
+    df_u64_big = pl.DataFrame(
+        {"side": ["buy", "sell"], "qty": [2**63 + 1, 4]},
+        schema={"side": pl.String, "qty": pl.UInt64},
+    )
+    assert_frame_equal(
+        df_u64_big.lazy()
+        .select(
+            (
+                pl.when(pl.col("side") == "buy").then(1).otherwise(-1) * pl.col("qty")
+            ).alias("out")
+        )
+        .collect(engine=engine),
+        pl.DataFrame({"out": [None, -4]}, schema={"out": pl.Int64}),
+    )
